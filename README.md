@@ -28,8 +28,8 @@ A toolkit for processing Apollo Cyber RT record files, including:
    conda activate apollo2rosbag
    
 ## Usage
-Open apollo_to_rosbag_ringtime_nowarn.py in a text editor
-Modify the topic list as needed
-Save and run the conversion script
+1. Open apollo_to_rosbag_ringtime_nowarn.py in a text editor
+2. Modify the topic list as needed
+3. Save and run the conversion script
    ```bash
    python apollo_to_rosbag_ringtime_nowarn.py <input.record> <output.bag>
