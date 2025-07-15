@@ -19,7 +19,7 @@ A toolkit for processing Apollo Cyber RT record files, including:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/your-username/apollo2rosbag.git
+   git clone https://github.com/SimonovBlonsky/apollo2rosbag.git
    cd apollo2rosbag
    
 2. Create and activate the conda environment:
