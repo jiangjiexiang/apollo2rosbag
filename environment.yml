@@ -46,4 +46,3 @@ dependencies:
       - rospkg==1.6.0
       - six==1.17.0
       - tqdm==4.67.1
-prefix: /home/chenguyuan/anaconda3/envs/record2bag
