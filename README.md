@@ -25,7 +25,7 @@ A toolkit for processing Apollo Cyber RT record files, including:
 2. Create and activate the conda environment:
    ```bash
    conda env create -f environment.yml
-   conda activate apollo2rosbag
+   conda activate record2bag
    
 ## Usage
 1. Open apollo_to_rosbag_ringtime_nowarn.py in a text editor
