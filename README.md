@@ -33,3 +33,5 @@ A toolkit for processing Apollo Cyber RT record files, including:
 3. Save and run the conversion script
    ```bash
    python apollo_to_rosbag_ringtime_nowarn.py <input.record> <output.bag>
+
+    python record2bag_mid360.py record-0726/20250726170621.record.00001 record0
