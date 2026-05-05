@@ -4,6 +4,7 @@
 import os
 import sys
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import rosbag
 import rospy
@@ -37,13 +38,13 @@ def clip_u16(x):
 
 def detect_scale(points_xyz, warn_prefix=""):
     """
-    粗略检测单位（m vs mm）。若坐标范围非常大（> 10000），判做 mm -> m
+    粗略检测单位（m vs mm）。若坐标范围非常大（> 1000），判做 mm -> m
     points_xyz: (N,3) ndarray
     """
     if points_xyz.size == 0:
         return 1.0
     max_abs = np.max(np.abs(points_xyz))
-    if max_abs > 1e5:    # 非常大，基本可以断定是 mm
+    if max_abs > 1000.0:    # Mid360 正常量程内坐标不应超过 1000m
         scale = 1.0 / 1000.0
         print(f"{warn_prefix}[INFO] Auto-detected point unit seems mm. Apply scale 1/1000.")
     else:
@@ -112,6 +113,7 @@ class LivoxConverter(object):
                  lidar_topic="/livox/lidar",
                  imu_topic_out="/livox/imu",
                  auto_unit_detect=True,
+                 point_unit="auto",
                  drop_zero_points=True,
                  debug=False):
         self.use_driver2 = use_driver2
@@ -122,6 +124,7 @@ class LivoxConverter(object):
         self.lidar_topic = lidar_topic
         self.imu_topic_out = imu_topic_out
         self.auto_unit_detect = auto_unit_detect
+        self.point_unit = point_unit
         self.drop_zero_points = drop_zero_points
         self.debug = debug
 
@@ -147,8 +150,12 @@ class LivoxConverter(object):
         if self.global_base_ns <= 0:
             self.global_base_ns = 0
 
-        if self.auto_unit_detect:
-            pts_np = np.array([[p[0], p[1], p[2]] for p in pc['points']], dtype=np.float64)
+        pts_np = np.array([[p[0], p[1], p[2]] for p in pc['points']], dtype=np.float64)
+        if self.point_unit == "m":
+            self.scale = 1.0
+        elif self.point_unit == "mm":
+            self.scale = 1.0 / 1000.0
+        elif self.auto_unit_detect:
             self.scale = detect_scale(pts_np, warn_prefix="[UNIT] ")
 
     def to_custom_msg(self, pc, lidar_id=1):
@@ -205,10 +212,10 @@ class LivoxConverter(object):
             if self.drop_zero_points and abs(x) < 1e-7 and abs(y) < 1e-7 and abs(z) < 1e-7:
                 continue
 
-            # 单位缩放
-            x *= 0.001
-            y *= 0.001
-            z *= 0.001
+            # ROS/Livox 点云坐标使用米。Apollo 记录可能已经是米，也可能是毫米。
+            x *= self.scale
+            y *= self.scale
+            z *= self.scale
 
             # offset_time 以本帧第一点为基准（us）
             offset_us = max(0, (time_ns - first_time_ns) // 1000)
@@ -299,50 +306,59 @@ class LivoxConverter(object):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Convert Apollo Mid360 record to Livox CustomMsg rosbag.")
-    p.add_argument("input_record", type=str, help="Input .record")
-    p.add_argument("output_bag", type=str, help="Output .bag")
+    p.add_argument("input_record", type=str, help="Input .record file, or a directory containing record files")
+    p.add_argument("output_bag", type=str, help="Output .bag file, or output directory when input_record is a directory")
     p.add_argument("--use_driver2", action="store_true", help="Use livox_ros_driver2 message type")
-    p.add_argument("--imu_topic", default="/apollo/sensor/mid_360/location/Imu", help="IMU topic in record")
-    p.add_argument("--pc_topic", default="/apollo/sensor/mid_360/location/PointCloud2", help="PointCloud topic in record")
+    p.add_argument("--imu_topic", default="/apollo/sensor/mid_360/Imu", help="IMU topic in record")
+    p.add_argument("--pc_topic", default="/apollo/sensor/mid_360/PointCloud2", help="PointCloud topic in record")
     p.add_argument("--lidar_topic_out", default="/livox/lidar", help="Output lidar topic")
     p.add_argument("--imu_topic_out", default="/livox/imu", help="Output imu topic")
     p.add_argument("--lidar_frame", default="livox_frame", help="lidar frame_id")
     p.add_argument("--imu_frame", default="livox_imu_frame", help="imu frame_id")
     p.add_argument("--no_auto_unit_detect", action="store_true", help="Disable auto unit detection")
+    p.add_argument("--point_unit", choices=["auto", "m", "mm"], default="auto", help="Input point distance unit")
     p.add_argument("--keep_zero_points", action="store_true", help="Keep zero (0,0,0) points")
+    p.add_argument("--jobs", type=int, default=8, help="Number of parallel conversions in batch mode")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def collect_record_files(input_path):
+    if os.path.isfile(input_path):
+        return [input_path]
 
-    if not os.path.exists(args.input_record):
-        print(f"[FATAL] Input file not found: {args.input_record}")
-        sys.exit(1)
+    record_files = []
+    for name in sorted(os.listdir(input_path)):
+        path = os.path.join(input_path, name)
+        if os.path.isfile(path):
+            record_files.append(path)
+    return record_files
 
-    # 离线写 bag 不一定需要 init_node，但 Fast-LIO 有时依赖 ros::Time::now/rosparam
-    rospy.init_node('apollo_to_rosbag_mid360', anonymous=True, disable_signals=True)
 
-    try:
-        use_driver2, CustomMsg, CustomPoint = try_import_driver(args.use_driver2)
-    except Exception as e:
-        print(f"[FATAL] Cannot import Livox driver (use_driver2={args.use_driver2}). {e}")
-        sys.exit(1)
+def make_output_path(input_record, output_path, batch_mode, index=None):
+    if not batch_mode:
+        return output_path
 
-    print(f"[INFO] Converting {args.input_record} -> {args.output_bag}")
+    if index is None:
+        raise ValueError("index is required in batch mode")
+
+    return os.path.join(output_path, f"{index}.bag")
+
+
+def convert_one(args, input_record, output_bag, use_driver2, CustomMsg, CustomPoint):
+    print(f"[INFO] Converting {input_record} -> {output_bag}")
     print(f"[INFO] Using {'livox_ros_driver2' if use_driver2 else 'livox_ros_driver'} message type")
 
     pointcloud_data, imu_data = extract_data(
-        args.input_record,
+        input_record,
         imu_topic=args.imu_topic,
         pc_topic=args.pc_topic
     )
 
     if len(pointcloud_data) == 0:
-        print("[WARN] No pointcloud frames found!")
+        print(f"[WARN] No pointcloud frames found in {input_record}!")
     if len(imu_data) == 0:
-        print("[WARN] No imu data found!")
+        print(f"[WARN] No imu data found in {input_record}!")
 
     converter = LivoxConverter(
         use_driver2=use_driver2,
@@ -353,13 +369,102 @@ def main():
         lidar_topic=args.lidar_topic_out,
         imu_topic_out=args.imu_topic_out,
         auto_unit_detect=(not args.no_auto_unit_detect),
+        point_unit=args.point_unit,
         drop_zero_points=(not args.keep_zero_points),
         debug=args.debug
     )
 
-    converter.write_bag(args.output_bag, pointcloud_data, imu_data)
+    converter.write_bag(output_bag, pointcloud_data, imu_data)
+    print(f"[OK] Conversion completed: {output_bag}")
 
-    print("[OK] Conversion completed successfully.")
+
+def convert_one_worker(args, input_record, output_bag):
+    try:
+        use_driver2, CustomMsg, CustomPoint = try_import_driver(args.use_driver2)
+    except Exception as e:
+        raise RuntimeError(f"Cannot import Livox driver (use_driver2={args.use_driver2}). {e}")
+
+    convert_one(args, input_record, output_bag, use_driver2, CustomMsg, CustomPoint)
+    return output_bag
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.input_record):
+        print(f"[FATAL] Input path not found: {args.input_record}")
+        sys.exit(1)
+
+    batch_mode = os.path.isdir(args.input_record)
+    if batch_mode:
+        if os.path.isfile(args.output_bag):
+            print(f"[FATAL] Output path must be a directory in batch mode: {args.output_bag}")
+            sys.exit(1)
+        os.makedirs(args.output_bag, exist_ok=True)
+        input_records = collect_record_files(args.input_record)
+        if len(input_records) == 0:
+            print(f"[FATAL] No files found in input directory: {args.input_record}")
+            sys.exit(1)
+    else:
+        input_records = [args.input_record]
+
+    jobs = max(1, int(args.jobs))
+    if not batch_mode and jobs != 1:
+        print("[WARN] --jobs is only used in batch mode. Single-file conversion will run with one process.")
+        jobs = 1
+    if batch_mode:
+        jobs = min(jobs, len(input_records))
+
+    try:
+        use_driver2, CustomMsg, CustomPoint = try_import_driver(args.use_driver2)
+    except Exception as e:
+        print(f"[FATAL] Cannot import Livox driver (use_driver2={args.use_driver2}). {e}")
+        sys.exit(1)
+
+    failed = []
+    total = len(input_records)
+    if batch_mode:
+        print(f"[INFO] Batch mode: found {total} files in {args.input_record}")
+        print(f"[INFO] Parallel jobs: {jobs}")
+
+    if jobs == 1:
+        # 离线写 bag 不一定需要 init_node，但 Fast-LIO 有时依赖 ros::Time::now/rosparam
+        rospy.init_node('apollo_to_rosbag_mid360', anonymous=True, disable_signals=True)
+
+        for index, input_record in enumerate(input_records, start=1):
+            output_bag = make_output_path(input_record, args.output_bag, batch_mode, index=index - 1)
+            if batch_mode:
+                print(f"[INFO] [{index}/{total}]")
+            try:
+                convert_one(args, input_record, output_bag, use_driver2, CustomMsg, CustomPoint)
+            except Exception as e:
+                failed.append((input_record, str(e)))
+                print(f"[ERROR] Failed to convert {input_record}: {e}")
+    else:
+        tasks = {}
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            for index, input_record in enumerate(input_records, start=1):
+                output_bag = make_output_path(input_record, args.output_bag, batch_mode, index=index - 1)
+                print(f"[INFO] Submit [{index}/{total}] {input_record} -> {output_bag}")
+                future = executor.submit(convert_one_worker, args, input_record, output_bag)
+                tasks[future] = input_record
+
+            for future in as_completed(tasks):
+                input_record = tasks[future]
+                try:
+                    output_bag = future.result()
+                    print(f"[OK] Finished: {output_bag}")
+                except Exception as e:
+                    failed.append((input_record, str(e)))
+                    print(f"[ERROR] Failed to convert {input_record}: {e}")
+
+    if failed:
+        print(f"[FATAL] {len(failed)}/{total} conversions failed:")
+        for input_record, error in failed:
+            print(f"  - {input_record}: {error}")
+        sys.exit(1)
+
+    print("[OK] All conversions completed successfully.")
 
 
 if __name__ == '__main__':
