@@ -22,7 +22,7 @@ A toolkit for processing Apollo Cyber RT record files, including:
    git clone https://github.com/SimonovBlonsky/apollo2rosbag.git
    cd apollo2rosbag
    ```
-   
+
 2. Create and activate the conda environment:
    ```bash
    conda env create -f environment.yml
@@ -51,13 +51,13 @@ the environment before running the scripts:
 export PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:$PYTHONPATH
 ```
 
-Install Livox message packages separately if you use `record2bag_mid360.py`.
-For Livox ROS Driver 2, source the workspace that provides
-`livox_ros_driver2/CustomMsg`.
-   
+Install Livox message packages separately if you use `record2bag_all.py` or
+`record2bag_mid360.py`. For Livox ROS Driver 2, source the workspace that
+provides `livox_ros_driver2/CustomMsg`.
+
 ## Usage
 
-Source ROS and the Livox message workspace before running conversion:
+Run conversions with ROS and Livox sourced:
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -65,81 +65,52 @@ source ~/ws_livox/devel/setup.bash
 conda activate record2bag
 ```
 
-### List Apollo record topics
-
-Use the helper script to inspect a record file or a directory of record splits:
+### 查看 record 里有哪些话题
 
 ```bash
-python list_apollo_topics.py record410
-python list_apollo_topics.py record410 --per-file
+python list_apollo_topics.py 0522/20260522111222.record.00000
+python list_apollo_topics.py 0522                  # 整个目录
 ```
 
-If a record index is broken or incomplete, scan messages directly:
+### 转换（推荐：全话题）
+
+`record2bag_all.py`：有数据的话题都转；Mid360 点云/IMU 走 Livox 格式，其余话题名与 Apollo 一致。
 
 ```bash
-python list_apollo_topics.py record410 --scan
-python list_apollo_topics.py record410 --scan --limit 50000
+# 单个文件
+python record2bag_all.py 0522/20260522111222.record.00000 out.bag
+
+# 整个文件夹 -> rosbag_out/0.bag, 1.bag, ...（默认 4 进程并行）
+python record2bag_all.py 0522 rosbag_out
+python record2bag_all.py 0522 rosbag_out --jobs 8
 ```
 
-### Convert Mid360 Apollo records
+Mid360 话题映射：
 
-Convert one Apollo record file:
+| Apollo | ROS |
+|---|---|
+| `/apollo/sensor/mid_360/PointCloud2` | `/livox/lidar` (`livox_ros_driver/CustomMsg`) |
+| `/apollo/sensor/mid_360/Imu` | `/livox/imu` (`sensor_msgs/Imu`) |
+
+常用可选参数：
 
 ```bash
-python record2bag_mid360.py record410/20260409172152.record.00000 rosbag410/0.bag --point_unit m
+--use_driver2          # 使用 livox_ros_driver2
+--point_unit mm        # 点云坐标是毫米时再指定（默认已是 m）
 ```
 
-Convert every file in a directory. Output bags are named by sorted input order:
-`0.bag`, `1.bag`, `2.bag`, and so on.
+### 只转 Mid360（Livox）
+
+不需要定位/GNSS 等其它话题时用：
 
 ```bash
-python record2bag_mid360.py record410 rosbag410 --jobs 8 --point_unit m
+python record2bag_mid360.py 0522/20260522111222.record.00000 out.bag
+python record2bag_mid360.py 0522 rosbag_out --jobs 8
 ```
 
-Use Livox ROS Driver 2 message types:
+### 播放
 
 ```bash
-python record2bag_mid360.py record410 rosbag410 --jobs 8 --use_driver2 --point_unit m
-```
-
-Distance unit options:
-
-```bash
---point_unit auto  # Auto-detect input point unit.
---point_unit m     # Input point coordinates are already meters.
---point_unit mm    # Input point coordinates are millimeters.
-```
-
-Override Apollo input topics if needed:
-
-```bash
-python record2bag_mid360.py record410 rosbag410 \
-  --imu_topic /apollo/sensor/mid_360/Imu \
-  --pc_topic /apollo/sensor/mid_360/PointCloud2 \
-  --jobs 8 \
-  --point_unit m
-```
-
-### Convert other Apollo records
-
-For the camera/Hesai converter, edit the topic constants in
-`apollo_to_rosbag_ringtime_nowarn.py`, then run:
-
-```bash
-python apollo_to_rosbag_ringtime_nowarn.py <input.record> <output.bag>
-```
-
-### Play records
-
-Play an Apollo Cyber record with Apollo tools:
-
-```bash
-cyber_recorder play -f record410/20260409172152.record.00000
-cyber_recorder info record410/20260409172152.record.00000
-```
-
-Play a converted ROS bag:
-
-```bash
-rosbag play rosbag410/0.bag
+rosbag play out.bag
+rosbag play rosbag_out/0.bag
 ```

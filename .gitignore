@@ -1,4 +1,6 @@
 .codex
+__pycache__/
 
 record410/
 rosbag410/
+0522/
