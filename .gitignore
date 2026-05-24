@@ -1,6 +1,8 @@
 .codex
 __pycache__/
 
+*.bag
+
 record410/
 rosbag410/
 0522/

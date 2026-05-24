@@ -4,6 +4,7 @@
 import argparse
 import base64
 import json
+import math
 import os
 import sys
 from collections import Counter
@@ -15,8 +16,8 @@ from cyber_record.record import Record
 from geometry_msgs.msg import TransformStamped
 from google.protobuf import json_format
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
-from std_msgs.msg import ByteMultiArray, Header, String, UInt8MultiArray
+from sensor_msgs.msg import Imu, NavSatFix, NavSatStatus
+from std_msgs.msg import Header, String, UInt8MultiArray
 from tf2_msgs.msg import TFMessage
 
 from record2bag_mid360 import LivoxConverter, try_import_driver
@@ -96,12 +97,12 @@ def to_imu(msg, t_ns, frame_id=None):
     header.frame_id = resolved_frame
     ros_imu.header = header
 
-    ros_imu.linear_acceleration.x = float(msg.linear_acceleration.x)
-    ros_imu.linear_acceleration.y = float(msg.linear_acceleration.y)
-    ros_imu.linear_acceleration.z = float(msg.linear_acceleration.z)
-    ros_imu.angular_velocity.x = float(msg.angular_velocity.x)
-    ros_imu.angular_velocity.y = float(msg.angular_velocity.y)
-    ros_imu.angular_velocity.z = float(msg.angular_velocity.z)
+    ros_imu.linear_acceleration.x = _safe_float(msg.linear_acceleration.x)
+    ros_imu.linear_acceleration.y = _safe_float(msg.linear_acceleration.y)
+    ros_imu.linear_acceleration.z = _safe_float(msg.linear_acceleration.z)
+    ros_imu.angular_velocity.x = _safe_float(msg.angular_velocity.x)
+    ros_imu.angular_velocity.y = _safe_float(msg.angular_velocity.y)
+    ros_imu.angular_velocity.z = _safe_float(msg.angular_velocity.z)
     return ros_imu
 
 
@@ -120,6 +121,83 @@ def to_livox_imu(imu_dict, imu_frame):
     return ros_imu
 
 
+def _safe_float(v, fallback=0.0):
+    """Return fallback if v is NaN or cannot be converted."""
+    try:
+        f = float(v)
+        return fallback if math.isnan(f) else f
+    except Exception:
+        return fallback
+
+
+def _angular_velocity_body(pose):
+    """
+    Return (wx, wy, wz) in the vehicle body frame.
+
+    Apollo LocalizationEstimate stores two angular-velocity fields:
+      - angular_velocity     : ENU world frame  (often left unset → nan)
+      - angular_velocity_vrf : vehicle Right/Forward/Up frame (typically set)
+
+    ROS Odometry.twist.angular is expected in child_frame_id (base_link), so
+    the vehicle-frame value is the correct one to use.  The VRF axes
+    (Right, Forward, Up) map to ROS FLU (Forward, Left, Up) as:
+        ROS x (forward) =  VRF y (forward)
+        ROS y (left)    = -VRF x (right)
+        ROS z (up)      =  VRF z (up)
+    """
+    if pose.HasField("angular_velocity_vrf"):
+        vrf = pose.angular_velocity_vrf
+        wx = _safe_float(vrf.x)
+        wy = _safe_float(vrf.y)
+        wz = _safe_float(vrf.z)
+        # VRF → FLU rotation
+        return wy, -wx, wz
+
+    # Fall back to ENU angular_velocity only when vrf is absent
+    if pose.HasField("angular_velocity"):
+        av = pose.angular_velocity
+        wx = _safe_float(av.x)
+        wy = _safe_float(av.y)
+        wz = _safe_float(av.z)
+        if any(v != 0.0 for v in (wx, wy, wz)):
+            return wx, wy, wz
+
+    return 0.0, 0.0, 0.0
+
+
+# Fallback position variance (m²) used when uncertainty.position_std_dev is absent/nan
+_POS_VAR_DEFAULT = 0.1 ** 2   # 0.1 m
+# Fallback orientation variance (rad²) used when orientation_std_dev is absent/nan
+_ORI_VAR_DEFAULT = 0.1 ** 2   # ~5.7°
+
+
+def _fill_pose_covariance(odom, uncertainty):
+    """
+    Map Apollo Uncertainty std-devs → Odometry 6×6 pose covariance (row-major).
+    Index layout: [x, y, z, roll, pitch, yaw].
+    Only diagonal entries are filled; off-diagonal terms are left as 0.
+    """
+    cov = [0.0] * 36
+
+    if uncertainty is not None and uncertainty.HasField("position_std_dev"):
+        ps = uncertainty.position_std_dev
+        cov[0]  = _safe_float(ps.x, _POS_VAR_DEFAULT) ** 2
+        cov[7]  = _safe_float(ps.y, _POS_VAR_DEFAULT) ** 2
+        cov[14] = _safe_float(ps.z, _POS_VAR_DEFAULT) ** 2
+    else:
+        cov[0] = cov[7] = cov[14] = _POS_VAR_DEFAULT
+
+    if uncertainty is not None and uncertainty.HasField("orientation_std_dev"):
+        os_ = uncertainty.orientation_std_dev
+        cov[21] = _safe_float(os_.x, _ORI_VAR_DEFAULT) ** 2
+        cov[28] = _safe_float(os_.y, _ORI_VAR_DEFAULT) ** 2
+        cov[35] = _safe_float(os_.z, _ORI_VAR_DEFAULT) ** 2
+    else:
+        cov[21] = cov[28] = cov[35] = _ORI_VAR_DEFAULT
+
+    odom.pose.covariance = cov
+
+
 def to_odometry(msg, t_ns):
     odom = Odometry()
     cyber_header_to_ros(odom.header, msg.header if msg.HasField("header") else None, t_ns)
@@ -135,12 +213,18 @@ def to_odometry(msg, t_ns):
     odom.pose.pose.orientation.z = float(pose.orientation.qz)
     odom.pose.pose.orientation.w = float(pose.orientation.qw)
 
-    odom.twist.twist.linear.x = float(pose.linear_velocity.x)
-    odom.twist.twist.linear.y = float(pose.linear_velocity.y)
-    odom.twist.twist.linear.z = float(pose.linear_velocity.z)
-    odom.twist.twist.angular.x = float(pose.angular_velocity.x)
-    odom.twist.twist.angular.y = float(pose.angular_velocity.y)
-    odom.twist.twist.angular.z = float(pose.angular_velocity.z)
+    odom.twist.twist.linear.x = _safe_float(pose.linear_velocity.x)
+    odom.twist.twist.linear.y = _safe_float(pose.linear_velocity.y)
+    odom.twist.twist.linear.z = _safe_float(pose.linear_velocity.z)
+
+    wx, wy, wz = _angular_velocity_body(pose)
+    odom.twist.twist.angular.x = wx
+    odom.twist.twist.angular.y = wy
+    odom.twist.twist.angular.z = wz
+
+    uncertainty = msg.uncertainty if msg.HasField("uncertainty") else None
+    _fill_pose_covariance(odom, uncertainty)
+
     return odom
 
 
@@ -155,6 +239,110 @@ def decode_raw_bytes(data):
     return bytes(data)
 
 
+def _parse_gga(sentence):
+    """
+    Parse a $GPGGA / $GNGGA NMEA sentence.
+    Returns a dict with keys: lat, lon, alt, status, num_sv, hdop,
+    or None if the sentence is invalid / not a GGA.
+
+    GGA quality field → NavSatStatus:
+        0 = invalid       → STATUS_NO_FIX (-1)
+        1 = SPS fix       → STATUS_FIX    (0)
+        2 = DGPS          → STATUS_SBAS_FIX (1)
+        4 = RTK fixed     → STATUS_GBAS_FIX (2)
+        5 = RTK float     → STATUS_GBAS_FIX (2)  # closest ROS equivalent
+    """
+    try:
+        # strip checksum
+        body = sentence.strip()
+        if "*" in body:
+            body = body[:body.index("*")]
+        fields = body.split(",")
+        if len(fields) < 10:
+            return None
+        tag = fields[0].upper()
+        if not tag.endswith("GGA"):
+            return None
+
+        quality = int(fields[6]) if fields[6] else 0
+        if quality == 0:
+            return None
+
+        # latitude: ddmm.mmmm N/S
+        lat_raw = fields[2]
+        lat_hemi = fields[3]
+        if not lat_raw:
+            return None
+        lat_deg = float(lat_raw[:2])
+        lat_min = float(lat_raw[2:])
+        lat = lat_deg + lat_min / 60.0
+        if lat_hemi == "S":
+            lat = -lat
+
+        # longitude: dddmm.mmmm E/W
+        lon_raw = fields[4]
+        lon_hemi = fields[5]
+        if not lon_raw:
+            return None
+        lon_deg = float(lon_raw[:3])
+        lon_min = float(lon_raw[3:])
+        lon = lon_deg + lon_min / 60.0
+        if lon_hemi == "W":
+            lon = -lon
+
+        alt = float(fields[9]) if fields[9] else 0.0
+        num_sv = int(fields[7]) if fields[7] else 0
+        hdop = float(fields[8]) if fields[8] else 99.0
+
+        _quality_to_status = {
+            1: NavSatStatus.STATUS_FIX,
+            2: NavSatStatus.STATUS_SBAS_FIX,
+            4: NavSatStatus.STATUS_GBAS_FIX,
+            5: NavSatStatus.STATUS_GBAS_FIX,
+        }
+        status = _quality_to_status.get(quality, NavSatStatus.STATUS_FIX)
+
+        return {"lat": lat, "lon": lon, "alt": alt,
+                "status": status, "num_sv": num_sv, "hdop": hdop}
+    except Exception:
+        return None
+
+
+# Horizontal position variance (m²) per NavSatStatus used for NavSatFix.
+# These are conservative defaults; a proper RTK engine would supply better values.
+_NAVSATFIX_COV = {
+    NavSatStatus.STATUS_GBAS_FIX:  0.02 ** 2,   # RTK fixed/float  ~2 cm
+    NavSatStatus.STATUS_SBAS_FIX:  0.5  ** 2,   # DGPS             ~0.5 m
+    NavSatStatus.STATUS_FIX:       2.5  ** 2,   # SPS              ~2.5 m
+}
+
+
+def gga_to_navsatfix(sentence, t_ns, frame_id="gps"):
+    """Convert a single GGA NMEA sentence to sensor_msgs/NavSatFix, or None."""
+    gga = _parse_gga(sentence)
+    if gga is None:
+        return None
+
+    fix = NavSatFix()
+    fix.header.stamp = ns_to_ros_time(t_ns)
+    fix.header.frame_id = frame_id
+
+    fix.status.status = gga["status"]
+    fix.status.service = NavSatStatus.SERVICE_GPS
+
+    fix.latitude  = gga["lat"]
+    fix.longitude = gga["lon"]
+    fix.altitude  = gga["alt"]
+
+    var = _NAVSATFIX_COV.get(gga["status"], 2.5 ** 2)
+    fix.position_covariance = [var, 0, 0,
+                               0, var, 0,
+                               0, 0, var * 4]   # vertical ~2× worse
+    fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+
+    return fix
+
+
 def to_raw_data_messages(msg, topic, t_ns):
     payload = decode_raw_bytes(msg.data)
     outputs = []
@@ -164,6 +352,13 @@ def to_raw_data_messages(msg, topic, t_ns):
         ros_str = String()
         ros_str.data = text
         outputs.append((topic, ros_str))
+
+        # Also emit a NavSatFix on <topic_base>/fix if this is a GGA sentence
+        fix = gga_to_navsatfix(text.strip(), t_ns)
+        if fix is not None:
+            fix_topic = topic.replace("/raw_data", "/fix")
+            outputs.append((fix_topic, fix))
+
         return outputs
 
     ros_bytes = UInt8MultiArray()
@@ -182,7 +377,7 @@ def to_json_string(msg):
 
 
 def to_proto_bytes(msg):
-    ros_bytes = ByteMultiArray()
+    ros_bytes = UInt8MultiArray()
     ros_bytes.data = list(msg.SerializeToString())
     return ros_bytes
 
